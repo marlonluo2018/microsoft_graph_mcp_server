@@ -1742,9 +1742,22 @@ Subject: {original_subject}
         if importance:
             patch_data["importance"] = importance
 
-        await self.patch(f"/me/messages/{draft_id}", data=patch_data)
-        await self.post(f"/me/messages/{draft_id}/send", data={})
-        return {"status": "accepted", "id": draft_id}
+        try:
+            await self.patch(f"/me/messages/{draft_id}", data=patch_data)
+            await self.post(f"/me/messages/{draft_id}/send", data={})
+        except Exception:
+            # Best-effort: delete the orphan draft so the mailbox doesn't
+            # accumulate unsent drafts when PATCH or /send fails. Swallow
+            # cleanup errors so the original exception surfaces unchanged.
+            try:
+                await self.delete(f"/me/messages/{draft_id}")
+            except Exception:
+                pass
+            raise
+
+        # Match send_message's return shape (/me/sendMail returns 202 with
+        # empty body) so callers depending on the prior contract are unaffected.
+        return {}
 
     async def send_email(
         self,
