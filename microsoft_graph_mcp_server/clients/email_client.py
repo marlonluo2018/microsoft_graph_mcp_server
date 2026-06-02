@@ -1709,68 +1709,55 @@ Subject: {original_subject}
             # as it would create excessive spacing when HTML already has proper formatting
             reply_body = body + quoted_reply
 
-        message_data = {
+        # Use Graph's createReply to obtain a draft carrying In-Reply-To,
+        # References, and the original conversationId. PATCH our composed
+        # body/recipients onto the draft, then POST /send. This is required
+        # for Outlook conversation threading; /me/sendMail with a manually
+        # prefixed "RE:" subject does NOT thread (createReply is the only
+        # supported way to bind a reply to the original message envelope).
+        draft = await self.post(
+            f"/me/messages/{message_id}/createReply", data={}
+        )
+        draft_id = draft.get("id")
+        if not draft_id:
+            raise RuntimeError(
+                f"createReply did not return a draft id: {draft!r}"
+            )
+
+        patch_data: Dict[str, Any] = {
             "subject": reply_subject,
             "body": {"contentType": body_content_type, "content": reply_body},
             "toRecipients": [
                 {"emailAddress": {"address": addr}} for addr in to_recipients
             ],
         }
-
         if cc_recipients:
-            message_data["ccRecipients"] = [
+            patch_data["ccRecipients"] = [
                 {"emailAddress": {"address": addr}} for addr in cc_recipients
             ]
-
         if bcc_recipients:
-            message_data["bccRecipients"] = [
+            patch_data["bccRecipients"] = [
                 {"emailAddress": {"address": addr}} for addr in bcc_recipients
             ]
-
-        params = {"$expand": "attachments($select=id,name,contentType,isInline)"}
-        email_with_attachments = await self.get(
-            f"/me/messages/{message_id}", params=params
-        )
-        attachments = email_with_attachments.get("attachments", [])
-        inline_attachments = []
-
-        for attachment in attachments:
-            if attachment.get("isInline", False):
-                attachment_id = attachment.get("id", "")
-
-                try:
-                    attachment_with_content = await self.get(
-                        f"/me/messages/{message_id}/attachments/{attachment_id}"
-                    )
-                    content_bytes = attachment_with_content.get("contentBytes", "")
-                    content_id = attachment_with_content.get("contentId", "")
-                except Exception as e:
-                    logger.warning(f"Could not fetch attachment content for {attachment.get('name')}: {e}")
-                    content_bytes = ""
-                    content_id = ""
-
-                if content_id.startswith("<") and content_id.endswith(">"):
-                    content_id = content_id[1:-1]
-
-                inline_attachments.append(
-                    {
-                        "@odata.type": "#microsoft.graph.fileAttachment",
-                        "name": attachment.get("name", ""),
-                        "contentType": attachment.get("contentType", ""),
-                        "contentBytes": content_bytes,
-                        "isInline": True,
-                        "id": attachment.get("id", ""),
-                        "contentId": content_id,
-                    }
-                )
-
-        if inline_attachments:
-            message_data["attachments"] = inline_attachments
-
         if importance:
-            message_data["importance"] = importance
+            patch_data["importance"] = importance
 
-        return await self.send_message(message_data)
+        try:
+            await self.patch(f"/me/messages/{draft_id}", data=patch_data)
+            await self.post(f"/me/messages/{draft_id}/send", data={})
+        except Exception:
+            # Best-effort: delete the orphan draft so the mailbox doesn't
+            # accumulate unsent drafts when PATCH or /send fails. Swallow
+            # cleanup errors so the original exception surfaces unchanged.
+            try:
+                await self.delete(f"/me/messages/{draft_id}")
+            except Exception:
+                pass
+            raise
+
+        # Match send_message's return shape (/me/sendMail returns 202 with
+        # empty body) so callers depending on the prior contract are unaffected.
+        return {}
 
     async def send_email(
         self,
